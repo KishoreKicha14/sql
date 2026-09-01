@@ -11,6 +11,14 @@ import org.opensearch.tasks.CancellableTask;
 
 public class PPLQueryTask extends CancellableTask {
 
+  /**
+   * Task header stamped on every child DSL search a PPL query issues, carrying the PPL coordinator
+   * task id as {@code nodeId:taskId}. Registered via {@code SQLPlugin.getTaskHeaders()} so
+   * OpenSearch copies it into child search tasks (including on remote data nodes), letting Query
+   * Insights associate those searches back to the originating PPL query.
+   */
+  public static final String PPL_COORDINATOR_ID_HEADER = "X-PPL-Coordinator-Id";
+
   public PPLQueryTask(
       long id,
       String type,

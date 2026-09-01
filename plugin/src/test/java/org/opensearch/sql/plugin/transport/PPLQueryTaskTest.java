@@ -79,4 +79,11 @@ public class PPLQueryTaskTest {
     // the tasks API for Query Insights.
     assertTrue(newTask().supportsResourceTracking());
   }
+
+  @Test
+  public void testPplCoordinatorIdHeaderName() {
+    // Query Insights relies on this exact header name to associate child DSL searches with the
+    // originating PPL query; it must match what SQLPlugin.getTaskHeaders() registers.
+    assertEquals("X-PPL-Coordinator-Id", PPLQueryTask.PPL_COORDINATOR_ID_HEADER);
+  }
 }

@@ -324,6 +324,16 @@ public class SQLPlugin extends Plugin
     };
   }
 
+  /**
+   * Register the PPL coordinator-id header so OpenSearch copies it from a PPL query's thread
+   * context into the child DSL search tasks it spawns (including on remote data nodes). This lets
+   * Query Insights associate those searches back to the originating PPL query.
+   */
+  @Override
+  public Collection<String> getTaskHeaders() {
+    return List.of(org.opensearch.sql.plugin.transport.PPLQueryTask.PPL_COORDINATOR_ID_HEADER);
+  }
+
   /** Register action and handler so that transportClient can find proxy for action. */
   @Override
   public List<ActionHandler<? extends ActionRequest, ? extends ActionResponse>> getActions() {

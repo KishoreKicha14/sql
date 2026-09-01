@@ -161,6 +161,27 @@ public class TransportPPLQueryAction
   }
 
   /**
+   * Stamp the PPL coordinator task id ({@code nodeId:taskId}) into the thread context so it rides
+   * on every child DSL search this query issues. Registered via {@code SQLPlugin.getTaskHeaders()},
+   * the header is copied into the child search tasks (including on remote data nodes), letting
+   * Query Insights associate those searches back to this PPL query. Best-effort: any failure is
+   * swallowed so header stamping never breaks query execution, and it does not overwrite a header
+   * already present (e.g. a nested PPL call).
+   */
+  private void stampPplCoordinatorHeader(PPLQueryTask pplQueryTask) {
+    try {
+      org.opensearch.common.util.concurrent.ThreadContext threadContext =
+          clientRef.threadPool().getThreadContext();
+      if (threadContext.getHeader(PPLQueryTask.PPL_COORDINATOR_ID_HEADER) == null) {
+        String coordinatorId = clusterServiceRef.localNode().getId() + ":" + pplQueryTask.getId();
+        threadContext.putHeader(PPLQueryTask.PPL_COORDINATOR_ID_HEADER, coordinatorId);
+      }
+    } catch (Exception e) {
+      LOG.warn("Failed to stamp PPL coordinator header for Query Insights association", e);
+    }
+  }
+
+  /**
    * {@inheritDoc} Transform the request and call super.doExecute() to support call from other
    * plugins.
    */
@@ -185,6 +206,7 @@ public class TransportPPLQueryAction
 
     if (task instanceof PPLQueryTask pplQueryTask) {
       OpenSearchQueryManager.setCancellableTask(pplQueryTask);
+      stampPplCoordinatorHeader(pplQueryTask);
     }
     Metrics.getInstance().getNumericalMetric(MetricName.PPL_REQ_TOTAL).increment();
     Metrics.getInstance().getNumericalMetric(MetricName.PPL_REQ_COUNT_TOTAL).increment();
