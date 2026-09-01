@@ -5,6 +5,8 @@
 
 package org.opensearch.sql.monitor.profile;
 
+import com.sun.management.ThreadMXBean;
+import java.lang.management.ManagementFactory;
 import java.util.Locale;
 
 /**
@@ -28,6 +30,26 @@ public final class ProfileScope implements AutoCloseable {
 
   private static volatile PhaseListener listener = PhaseListener.NOOP;
 
+  /**
+   * Per-thread CPU/allocated-memory sampler. Resolved to the {@code com.sun.management} bean when
+   * available; left null otherwise so CPU/memory profiling degrades to a no-op (time is still
+   * recorded). Every phase's scope opens and closes on the same thread, so sampling the opening
+   * thread at both ends yields a correct single-thread delta.
+   */
+  private static final ThreadMXBean THREAD_MX_BEAN = resolveThreadMXBean();
+
+  private static ThreadMXBean resolveThreadMXBean() {
+    try {
+      java.lang.management.ThreadMXBean bean = ManagementFactory.getThreadMXBean();
+      if (bean instanceof ThreadMXBean) {
+        return (ThreadMXBean) bean;
+      }
+    } catch (Exception e) {
+      // Metric unavailable on this JVM; fall back to time-only profiling.
+    }
+    return null;
+  }
+
   /** Install a global phase listener (typically from the {@code opensearch} module). */
   public static void installListener(PhaseListener newListener) {
     listener = newListener == null ? PhaseListener.NOOP : newListener;
@@ -35,19 +57,25 @@ public final class ProfileScope implements AutoCloseable {
 
   private final ProfileMetric metric;
   private final long startNanos;
+  private final long threadId;
+  private final long startCpuNanos;
+  private final long startAllocatedBytes;
   private final PhaseListener.Handle handle;
 
-  private ProfileScope(ProfileMetric metric, long startNanos, PhaseListener.Handle handle) {
+  private ProfileScope(ProfileMetric metric, PhaseListener.Handle handle) {
     this.metric = metric;
-    this.startNanos = startNanos;
     this.handle = handle;
+    this.threadId = Thread.currentThread().getId();
+    this.startCpuNanos = sampleCpuNanos(threadId);
+    this.startAllocatedBytes = sampleAllocatedBytes(threadId);
+    // Read the wall clock last so it most tightly brackets the timed block.
+    this.startNanos = System.nanoTime();
   }
 
   /** Open a phase that records a profile metric and (if a listener is installed) a tracing span. */
   public static ProfileScope open(MetricName metric) {
     return new ProfileScope(
         QueryProfiling.current().getOrCreateMetric(metric),
-        System.nanoTime(),
         listener.onPhaseStart(metric.name().toLowerCase(Locale.ROOT)));
   }
 
@@ -58,8 +86,7 @@ public final class ProfileScope implements AutoCloseable {
    * chosen by the caller, not derived from user input.
    */
   public static ProfileScope openTraceOnly(String phaseName) {
-    return new ProfileScope(
-        NoopProfileMetric.INSTANCE, System.nanoTime(), listener.onPhaseStart(phaseName));
+    return new ProfileScope(NoopProfileMetric.INSTANCE, listener.onPhaseStart(phaseName));
   }
 
   /** Record a failure on the listener's handle. Callers invoke this before rethrowing. */
@@ -69,7 +96,26 @@ public final class ProfileScope implements AutoCloseable {
 
   @Override
   public void close() {
-    metric.add(System.nanoTime() - startNanos);
+    long elapsedNanos = System.nanoTime() - startNanos;
+    long cpuNanos = deltaOrZero(sampleCpuNanos(threadId), startCpuNanos);
+    long memoryBytes = deltaOrZero(sampleAllocatedBytes(threadId), startAllocatedBytes);
+    metric.record(elapsedNanos, cpuNanos, memoryBytes);
     handle.close();
+  }
+
+  private static long sampleCpuNanos(long threadId) {
+    return THREAD_MX_BEAN == null ? -1L : THREAD_MX_BEAN.getThreadCpuTime(threadId);
+  }
+
+  private static long sampleAllocatedBytes(long threadId) {
+    return THREAD_MX_BEAN == null ? -1L : THREAD_MX_BEAN.getThreadAllocatedBytes(threadId);
+  }
+
+  /** Returns {@code end - start} when both samples are valid and non-decreasing, else 0. */
+  private static long deltaOrZero(long end, long start) {
+    if (end < 0 || start < 0 || end < start) {
+      return 0L;
+    }
+    return end - start;
   }
 }

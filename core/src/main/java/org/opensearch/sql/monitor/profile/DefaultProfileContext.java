@@ -55,11 +55,19 @@ public class DefaultProfileContext implements ProfileContext {
     }
     finished = true;
     long endNanos = System.nanoTime();
-    Map<MetricName, Double> snapshot = new LinkedHashMap<>(MetricName.values().length);
+    Map<MetricName, QueryProfile.PhaseMeasurement> snapshot =
+        new LinkedHashMap<>(MetricName.values().length);
     for (MetricName metricName : MetricName.values()) {
       DefaultMetricImpl metric = metrics.get(metricName);
-      double millis = metric == null ? 0d : ProfileUtils.roundToMillis(metric.value());
-      snapshot.put(metricName, millis);
+      if (metric == null) {
+        snapshot.put(metricName, QueryProfile.PhaseMeasurement.ZERO);
+        continue;
+      }
+      double timeMillis = ProfileUtils.roundToMillis(metric.value());
+      double cpuMillis = ProfileUtils.roundToMillis(metric.cpuNanos());
+      snapshot.put(
+          metricName,
+          new QueryProfile.PhaseMeasurement(timeMillis, cpuMillis, metric.memoryBytes()));
     }
     double totalMillis = ProfileUtils.roundToMillis(endNanos - startNanos);
     Object planSnapshot =

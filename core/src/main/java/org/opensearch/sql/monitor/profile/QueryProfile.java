@@ -31,9 +31,9 @@ public final class QueryProfile {
    * Create a new query profile snapshot.
    *
    * @param totalTimeMillis total elapsed milliseconds for the query (rounded to two decimals)
-   * @param phases metric values keyed by {@link MetricName}
+   * @param phases per-phase measurements keyed by {@link MetricName}
    */
-  public QueryProfile(double totalTimeMillis, Map<MetricName, Double> phases) {
+  public QueryProfile(double totalTimeMillis, Map<MetricName, PhaseMeasurement> phases) {
     this(totalTimeMillis, phases, null, null);
   }
 
@@ -41,10 +41,11 @@ public final class QueryProfile {
    * Create a new query profile snapshot.
    *
    * @param totalTimeMillis total elapsed milliseconds for the query (rounded to two decimals)
-   * @param phases metric values keyed by {@link MetricName}
+   * @param phases per-phase measurements keyed by {@link MetricName}
    * @param plan plan tree profiling output
    */
-  public QueryProfile(double totalTimeMillis, Map<MetricName, Double> phases, Object plan) {
+  public QueryProfile(
+      double totalTimeMillis, Map<MetricName, PhaseMeasurement> phases, Object plan) {
     this(totalTimeMillis, phases, plan, null);
   }
 
@@ -52,26 +53,49 @@ public final class QueryProfile {
    * Create a new query profile snapshot.
    *
    * @param totalTimeMillis total elapsed milliseconds for the query (rounded to two decimals)
-   * @param phases metric values keyed by {@link MetricName}
+   * @param phases per-phase measurements keyed by {@link MetricName}
    * @param plan plan tree profiling output
    * @param threadPool thread pool name that executed the query
    */
   public QueryProfile(
-      double totalTimeMillis, Map<MetricName, Double> phases, Object plan, String threadPool) {
-    this.summary = new Summary(totalTimeMillis);
+      double totalTimeMillis,
+      Map<MetricName, PhaseMeasurement> phases,
+      Object plan,
+      String threadPool) {
+    Objects.requireNonNull(phases, "phases");
     this.phases = buildPhases(phases);
+    this.summary = buildSummary(totalTimeMillis, this.phases.values());
     this.plan = plan;
     this.threadPool = threadPool;
   }
 
-  private Map<String, Phase> buildPhases(Map<MetricName, Double> phases) {
-    Objects.requireNonNull(phases, "phases");
+  private Map<String, Phase> buildPhases(Map<MetricName, PhaseMeasurement> phases) {
     Map<String, Phase> ordered = new LinkedHashMap<>(MetricName.values().length);
     for (MetricName metricName : MetricName.values()) {
-      Double value = phases.getOrDefault(metricName, 0d);
-      ordered.put(metricName.name().toLowerCase(Locale.ROOT), new Phase(value));
+      PhaseMeasurement m = phases.getOrDefault(metricName, PhaseMeasurement.ZERO);
+      ordered.put(
+          metricName.name().toLowerCase(Locale.ROOT),
+          new Phase(m.timeMillis(), m.cpuTimeMillis(), m.memoryBytes()));
     }
     return ordered;
+  }
+
+  private Summary buildSummary(double totalTimeMillis, Iterable<Phase> phases) {
+    double totalCpu = 0d;
+    long totalMemory = 0L;
+    for (Phase phase : phases) {
+      totalCpu += phase.getCpuTimeMillis();
+      totalMemory += phase.getMemoryBytes();
+    }
+    return new Summary(totalTimeMillis, totalCpu, totalMemory);
+  }
+
+  /**
+   * Immutable per-phase measurement passed in when building a profile: elapsed time, CPU time (both
+   * in milliseconds) and allocated memory in bytes.
+   */
+  public record PhaseMeasurement(double timeMillis, double cpuTimeMillis, long memoryBytes) {
+    public static final PhaseMeasurement ZERO = new PhaseMeasurement(0d, 0d, 0L);
   }
 
   @Getter
@@ -80,8 +104,16 @@ public final class QueryProfile {
     @SerializedName("total_time_ms")
     private final double totalTimeMillis;
 
-    private Summary(double totalTimeMillis) {
+    @SerializedName("total_cpu_time_ms")
+    private final double totalCpuTimeMillis;
+
+    @SerializedName("total_memory_bytes")
+    private final long totalMemoryBytes;
+
+    private Summary(double totalTimeMillis, double totalCpuTimeMillis, long totalMemoryBytes) {
       this.totalTimeMillis = totalTimeMillis;
+      this.totalCpuTimeMillis = totalCpuTimeMillis;
+      this.totalMemoryBytes = totalMemoryBytes;
     }
   }
 
@@ -91,8 +123,16 @@ public final class QueryProfile {
     @SerializedName("time_ms")
     private final double timeMillis;
 
-    private Phase(double timeMillis) {
+    @SerializedName("cpu_time_ms")
+    private final double cpuTimeMillis;
+
+    @SerializedName("memory_bytes")
+    private final long memoryBytes;
+
+    private Phase(double timeMillis, double cpuTimeMillis, long memoryBytes) {
       this.timeMillis = timeMillis;
+      this.cpuTimeMillis = cpuTimeMillis;
+      this.memoryBytes = memoryBytes;
     }
   }
 

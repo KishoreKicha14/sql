@@ -12,6 +12,8 @@ final class DefaultMetricImpl implements ProfileMetric {
 
   private final String name;
   private final LongAdder value = new LongAdder();
+  private final LongAdder cpuNanos = new LongAdder();
+  private final LongAdder memoryBytes = new LongAdder();
 
   /**
    * Construct a metric with the provided name.
@@ -41,5 +43,27 @@ final class DefaultMetricImpl implements ProfileMetric {
   public void set(long value) {
     this.value.reset();
     this.value.add(value);
+  }
+
+  @Override
+  public void record(long timeNanos, long cpuNanos, long memoryBytes) {
+    this.value.add(timeNanos);
+    // Negative deltas can occur if the JVM reports -1 for an unsupported metric; ignore those.
+    if (cpuNanos > 0) {
+      this.cpuNanos.add(cpuNanos);
+    }
+    if (memoryBytes > 0) {
+      this.memoryBytes.add(memoryBytes);
+    }
+  }
+
+  @Override
+  public long cpuNanos() {
+    return cpuNanos.sum();
+  }
+
+  @Override
+  public long memoryBytes() {
+    return memoryBytes.sum();
   }
 }

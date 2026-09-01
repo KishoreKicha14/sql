@@ -62,4 +62,21 @@ public class PPLQueryTaskTest {
     task.cancel("Test");
     assertTrue(task.isCancelled());
   }
+
+  private PPLQueryTask newTask() {
+    return new PPLQueryTask(
+        1,
+        "transport",
+        "cluster:admin/opensearch/ppl",
+        "test query",
+        TaskId.EMPTY_TASK_ID,
+        Map.of());
+  }
+
+  @Test
+  public void testSupportsResourceTracking() {
+    // Resource tracking must be enabled so the coordinator task's CPU/memory is exposed through
+    // the tasks API for Query Insights.
+    assertTrue(newTask().supportsResourceTracking());
+  }
 }

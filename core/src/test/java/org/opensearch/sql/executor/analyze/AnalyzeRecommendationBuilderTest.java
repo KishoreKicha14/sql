@@ -22,9 +22,9 @@ import org.opensearch.sql.monitor.profile.QueryProfile.PlanNode;
 class AnalyzeRecommendationBuilderTest {
 
   private static QueryProfile profile(double optimizeMs, double executeMs, PlanNode plan) {
-    Map<MetricName, Double> phases = new EnumMap<>(MetricName.class);
-    phases.put(MetricName.OPTIMIZE, optimizeMs);
-    phases.put(MetricName.EXECUTE, executeMs);
+    Map<MetricName, QueryProfile.PhaseMeasurement> phases = new EnumMap<>(MetricName.class);
+    phases.put(MetricName.OPTIMIZE, new QueryProfile.PhaseMeasurement(optimizeMs, 0d, 0L));
+    phases.put(MetricName.EXECUTE, new QueryProfile.PhaseMeasurement(executeMs, 0d, 0L));
     return new QueryProfile(optimizeMs + executeMs, phases, plan);
   }
 
@@ -211,9 +211,9 @@ class AnalyzeRecommendationBuilderTest {
   @Test
   void nonPlanNodePlanYieldsNoRecommendations() {
     // profile.plan is a pre-rendered object (not a PlanNode) -> no per-node rules can run.
-    Map<MetricName, Double> phases = new EnumMap<>(MetricName.class);
-    phases.put(MetricName.OPTIMIZE, 1.0);
-    phases.put(MetricName.EXECUTE, 10.0);
+    Map<MetricName, QueryProfile.PhaseMeasurement> phases = new EnumMap<>(MetricName.class);
+    phases.put(MetricName.OPTIMIZE, new QueryProfile.PhaseMeasurement(1.0, 0d, 0L));
+    phases.put(MetricName.EXECUTE, new QueryProfile.PhaseMeasurement(10.0, 0d, 0L));
     QueryProfile p = new QueryProfile(11.0, phases, "some pre-rendered plan string");
     assertTrue(new AnalyzeRecommendationBuilder(p).build().isEmpty());
   }
