@@ -10,6 +10,7 @@ import lombok.Builder;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.Singular;
+import org.opensearch.sql.common.utils.QueryContext;
 import org.opensearch.sql.monitor.profile.MetricName;
 import org.opensearch.sql.monitor.profile.ProfileMetric;
 import org.opensearch.sql.monitor.profile.QueryProfile;
@@ -57,7 +58,13 @@ public class SimpleJsonResponseFormatter extends JsonResponseFormatter<QueryResu
 
     formatMetric.set(System.nanoTime() - formatTime);
 
-    json.profile(QueryProfiling.current().finish());
+    // Profiling is always active internally so Query Insights can capture the per-phase
+    // breakdown, but the profile is only surfaced in the user response when the request
+    // explicitly asked for it. finish() must still be called to close the profile context.
+    QueryProfile profile = QueryProfiling.current().finish();
+    if (QueryContext.isProfileEnabled()) {
+      json.profile(profile);
+    }
     return json.build();
   }
 

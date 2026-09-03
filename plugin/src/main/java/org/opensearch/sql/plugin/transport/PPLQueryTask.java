@@ -7,17 +7,18 @@ package org.opensearch.sql.plugin.transport;
 
 import java.util.Map;
 import org.opensearch.core.tasks.TaskId;
+import org.opensearch.sql.monitor.profile.QueryProfile;
 import org.opensearch.tasks.CancellableTask;
 
 public class PPLQueryTask extends CancellableTask {
 
   /**
-   * Task header stamped on every child DSL search a PPL query issues, carrying the PPL coordinator
-   * task id as {@code nodeId:taskId}. Registered via {@code SQLPlugin.getTaskHeaders()} so
-   * OpenSearch copies it into child search tasks (including on remote data nodes), letting Query
-   * Insights associate those searches back to the originating PPL query.
+   * Per-phase profile snapshot for this query, stashed on the execution thread just before the
+   * profiling thread-local is cleared, so the resource-tracking completion listener can read it
+   * when it reports the query to Query Insights. Volatile because it is written on the execution
+   * thread and read on the completion-listener thread.
    */
-  public static final String PPL_COORDINATOR_ID_HEADER = "X-PPL-Coordinator-Id";
+  private volatile QueryProfile queryProfile;
 
   public PPLQueryTask(
       long id,
@@ -43,5 +44,14 @@ public class PPLQueryTask extends CancellableTask {
   @Override
   public boolean supportsResourceTracking() {
     return true;
+  }
+
+  /** The per-phase profile snapshot for this query, or {@code null} if not yet captured. */
+  public QueryProfile getQueryProfile() {
+    return queryProfile;
+  }
+
+  public void setQueryProfile(QueryProfile queryProfile) {
+    this.queryProfile = queryProfile;
   }
 }

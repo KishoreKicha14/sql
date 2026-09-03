@@ -40,6 +40,7 @@ import org.opensearch.sql.executor.QueryType;
 import org.opensearch.sql.legacy.metrics.MetricName;
 import org.opensearch.sql.legacy.metrics.Metrics;
 import org.opensearch.sql.monitor.profile.ProfileScope;
+import org.opensearch.sql.monitor.profile.QueryProfile;
 import org.opensearch.sql.monitor.profile.QueryProfiling;
 import org.opensearch.sql.opensearch.executor.OpenSearchQueryManager;
 import org.opensearch.sql.opensearch.executor.tracing.TracingPhaseListener;
@@ -161,24 +162,123 @@ public class TransportPPLQueryAction
   }
 
   /**
-   * Stamp the PPL coordinator task id ({@code nodeId:taskId}) into the thread context so it rides
-   * on every child DSL search this query issues. Registered via {@code SQLPlugin.getTaskHeaders()},
-   * the header is copied into the child search tasks (including on remote data nodes), letting
-   * Query Insights associate those searches back to this PPL query. Best-effort: any failure is
-   * swallowed so header stamping never breaks query execution, and it does not overwrite a header
-   * already present (e.g. a nested PPL call).
+   * Stamp the Query Insights parent marker ({@code PPL:<nodeId>:<taskId>}) into the thread context
+   * so it rides on every child DSL search this query issues. Registered via {@code
+   * SQLPlugin.getTaskHeaders()}, the header is copied into the child search tasks (including on
+   * remote data nodes), letting Query Insights classify each child and associate it back to this
+   * PPL query. Best-effort: any failure is swallowed so header stamping never breaks query
+   * execution, and it does not overwrite a header already present (e.g. a nested PPL call).
    */
-  private void stampPplCoordinatorHeader(PPLQueryTask pplQueryTask) {
+  private void stampQueryInsightsParentHeader(PPLQueryTask pplQueryTask) {
     try {
       org.opensearch.common.util.concurrent.ThreadContext threadContext =
           clientRef.threadPool().getThreadContext();
-      if (threadContext.getHeader(PPLQueryTask.PPL_COORDINATOR_ID_HEADER) == null) {
-        String coordinatorId = clusterServiceRef.localNode().getId() + ":" + pplQueryTask.getId();
-        threadContext.putHeader(PPLQueryTask.PPL_COORDINATOR_ID_HEADER, coordinatorId);
+      if (threadContext.getHeader(QueryInsightsMarker.PARENT_HEADER) == null) {
+        String value =
+            QueryInsightsMarker.value(
+                "PPL", clusterServiceRef.localNode().getId(), pplQueryTask.getId());
+        threadContext.putHeader(QueryInsightsMarker.PARENT_HEADER, value);
       }
     } catch (Exception e) {
-      LOG.warn("Failed to stamp PPL coordinator header for Query Insights association", e);
+      LOG.warn("Failed to stamp Query Insights parent header for query association", e);
     }
+  }
+
+  /**
+   * Register a completion listener on the coordinator task that reports the finished PPL query to
+   * Query Insights. The listener fires exactly once when the task's last resource-tracked thread
+   * closes (across inline, complex-worker, and background-prefetch paths), so {@code
+   * getTotalResourceStats()} is finalized when it runs. Best-effort: if tracking is already
+   * complete (listener not accepted) or the report fails, query execution is unaffected.
+   */
+  private void registerQueryInsightsReport(PPLQueryTask reportTask) {
+    try {
+      boolean registered =
+          reportTask.addResourceTrackingCompletionListener(
+              new org.opensearch.core.action.NotifyOnceListener<>() {
+                @Override
+                protected void innerOnResponse(org.opensearch.tasks.Task task) {
+                  sendQueryInsightsReport((PPLQueryTask) task);
+                }
+
+                @Override
+                protected void innerOnFailure(Exception e) {
+                  // Resource tracking failed to complete cleanly; nothing to report.
+                }
+              });
+      if (!registered) {
+        LOG.debug("PPL task resource tracking already complete; skipping Query Insights report");
+      }
+    } catch (Exception e) {
+      LOG.warn("Failed to register Query Insights report listener", e);
+    }
+  }
+
+  /**
+   * Build and best-effort send the {@link ReportQueryRequest} for a completed PPL query. Reads the
+   * finalized coordinator resource stats, the stashed query profile, and the query text. Any
+   * failure (including Query Insights not being installed) is swallowed.
+   */
+  private void sendQueryInsightsReport(PPLQueryTask reportTask) {
+    try {
+      String coordinatorId = clusterServiceRef.localNode().getId() + ":" + reportTask.getId();
+      String queryText = stripPplPrefix(reportTask.getDescription());
+
+      org.opensearch.core.tasks.resourcetracker.TaskResourceUsage usage =
+          reportTask.getTotalResourceStats();
+      long cpuNanos = usage == null ? 0L : usage.getCpuTimeInNanos();
+      long memoryBytes = usage == null ? 0L : usage.getMemoryInBytes();
+
+      QueryProfile profile = reportTask.getQueryProfile();
+      long latencyMillis = 0L;
+      java.util.List<ReportQueryRequest.PhaseMetric> phases = new java.util.ArrayList<>();
+      if (profile != null) {
+        if (profile.getSummary() != null) {
+          latencyMillis = Math.round(profile.getSummary().getTotalTimeMillis());
+        }
+        if (profile.getPhases() != null) {
+          profile
+              .getPhases()
+              .forEach(
+                  (name, phase) ->
+                      phases.add(
+                          new ReportQueryRequest.PhaseMetric(
+                              name,
+                              phase.getTimeMillis(),
+                              phase.getCpuTimeMillis(),
+                              phase.getMemoryBytes())));
+        }
+      }
+
+      ReportQueryRequest request =
+          new ReportQueryRequest(
+              "PPL",
+              coordinatorId,
+              queryText,
+              null,
+              latencyMillis,
+              cpuNanos,
+              memoryBytes,
+              System.currentTimeMillis(),
+              phases);
+
+      clientRef.execute(ReportQueryAction.INSTANCE, request, ActionListener.wrap(r -> {}, e -> {}));
+    } catch (Exception e) {
+      // Query Insights may not be installed, or the send may fail; never affect query execution.
+      LOG.debug("Failed to report PPL query to Query Insights", e);
+    }
+  }
+
+  /** Strip the {@code "PPL: "} / {@code "PPL [queryId=...]: "} description prefix. */
+  private static String stripPplPrefix(String description) {
+    if (description == null) {
+      return "";
+    }
+    int colon = description.indexOf(": ");
+    if (description.startsWith("PPL") && colon >= 0) {
+      return description.substring(colon + 2);
+    }
+    return description;
   }
 
   /**
@@ -204,9 +304,11 @@ public class TransportPPLQueryAction
       return;
     }
 
-    if (task instanceof PPLQueryTask pplQueryTask) {
-      OpenSearchQueryManager.setCancellableTask(pplQueryTask);
-      stampPplCoordinatorHeader(pplQueryTask);
+    final PPLQueryTask reportTask = task instanceof PPLQueryTask ? (PPLQueryTask) task : null;
+    if (reportTask != null) {
+      OpenSearchQueryManager.setCancellableTask(reportTask);
+      stampQueryInsightsParentHeader(reportTask);
+      registerQueryInsightsReport(reportTask);
     }
     Metrics.getInstance().getNumericalMetric(MetricName.PPL_REQ_TOTAL).increment();
     Metrics.getInstance().getNumericalMetric(MetricName.PPL_REQ_COUNT_TOTAL).increment();
@@ -238,7 +340,7 @@ public class TransportPPLQueryAction
     ActionListener<TransportPPLQueryResponse> tracedListener =
         TraceableActionListener.create(listener, rootSpan, tracer);
     ActionListener<TransportPPLQueryResponse> clearingListener =
-        wrapWithProfilingClear(tracedListener);
+        wrapWithProfilingClear(tracedListener, reportTask);
 
     try {
       // Route to analytics engine for non-Lucene (e.g., Parquet-backed) indices.
@@ -418,14 +520,14 @@ public class TransportPPLQueryAction
   }
 
   private ActionListener<TransportPPLQueryResponse> wrapWithProfilingClear(
-      ActionListener<TransportPPLQueryResponse> delegate) {
+      ActionListener<TransportPPLQueryResponse> delegate, PPLQueryTask reportTask) {
     return new ActionListener<>() {
       @Override
       public void onResponse(TransportPPLQueryResponse transportPPLQueryResponse) {
         try {
           delegate.onResponse(transportPPLQueryResponse);
         } finally {
-          QueryProfiling.clear();
+          stashProfileThenClear(reportTask);
         }
       }
 
@@ -434,9 +536,27 @@ public class TransportPPLQueryAction
         try {
           delegate.onFailure(e);
         } finally {
-          QueryProfiling.clear();
+          stashProfileThenClear(reportTask);
         }
       }
     };
+  }
+
+  /**
+   * Snapshot the per-phase profile onto the coordinator task (so the resource-tracking completion
+   * listener can report it to Query Insights), then clear the profiling thread-local. Runs on the
+   * execution thread where the profile is still bound. Best-effort: never throws into the response
+   * path.
+   */
+  private void stashProfileThenClear(PPLQueryTask reportTask) {
+    try {
+      if (reportTask != null) {
+        reportTask.setQueryProfile(QueryProfiling.current().finish());
+      }
+    } catch (Exception e) {
+      LOG.warn("Failed to capture PPL query profile for Query Insights", e);
+    } finally {
+      QueryProfiling.clear();
+    }
   }
 }

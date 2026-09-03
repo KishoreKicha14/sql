@@ -81,9 +81,16 @@ public class PPLQueryTaskTest {
   }
 
   @Test
-  public void testPplCoordinatorIdHeaderName() {
-    // Query Insights relies on this exact header name to associate child DSL searches with the
-    // originating PPL query; it must match what SQLPlugin.getTaskHeaders() registers.
-    assertEquals("X-PPL-Coordinator-Id", PPLQueryTask.PPL_COORDINATOR_ID_HEADER);
+  public void testQueryInsightsParentHeaderName() {
+    // Query Insights relies on this exact header name to classify child DSL searches and associate
+    // them with the originating query; it must match what SQLPlugin.getTaskHeaders() registers.
+    assertEquals("X-Query-Insights-Parent", QueryInsightsMarker.PARENT_HEADER);
+  }
+
+  @Test
+  public void testQueryInsightsParentHeaderValueIsSourcePrefixed() {
+    // Value format is <source>:<nodeId>:<taskId> so QI reads both source and parent id from one
+    // header. SQL will reuse the same helper with source "SQL".
+    assertEquals("PPL:node-1:42", QueryInsightsMarker.value("PPL", "node-1", 42L));
   }
 }

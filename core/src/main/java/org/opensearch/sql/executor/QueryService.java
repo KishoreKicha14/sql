@@ -219,12 +219,18 @@ public class QueryService {
     CalcitePlanContext.run(
         () -> {
           try {
-            QueryProfiling.activate(QueryContext.isProfileEnabled());
+            // Profiling is always active on the Calcite path so the per-phase CPU/memory
+            // breakdown is available for Query Insights on every query, not only when the
+            // request explicitly asked to profile. The extra cost is a handful of ThreadMXBean
+            // samples at phase boundaries.
+            QueryProfiling.activate(true);
             CalciteClassLoaderHelper.withCalciteClassLoader(
                 () -> {
                   CalcitePlanContext context;
-                  RelNode optimizedPlan;
-                  try (ProfileScope analyzePhase = ProfileScope.open(MetricName.ANALYZE)) {
+                  RelNode relNode;
+                  // PREPARE: build the execution context (parse/setup happen before this method,
+                  // but context creation is the earliest measurable step on this thread).
+                  try (ProfileScope preparePhase = ProfileScope.open(MetricName.PREPARE)) {
                     context =
                         CalcitePlanContext.create(
                             buildFrameworkConfig(),
@@ -233,24 +239,28 @@ public class QueryService {
                             includeMetadata);
 
                     context.setHighlightConfig(highlightConfig);
+                  }
 
-                    // Wrap analyze with ANALYZING stage tracking
-                    RelNode relNode =
+                  final CalcitePlanContext ctx = context;
+                  // ANALYZE: semantic analysis / validation of the query plan.
+                  try (ProfileScope analyzePhase = ProfileScope.open(MetricName.ANALYZE)) {
+                    relNode =
                         StageErrorHandler.executeStage(
                             QueryProcessingStage.ANALYZING,
-                            () -> analyze(plan, context),
+                            () -> analyze(plan, ctx),
                             "while preparing and validating the query plan");
+                  }
 
-                    // Wrap plan conversion with PLAN_CONVERSION stage tracking
+                  RelNode optimizedPlan;
+                  // OPTIMIZE: plan conversion to Calcite + Calcite optimization.
+                  try (ProfileScope optimizePhase = ProfileScope.open(MetricName.OPTIMIZE)) {
                     RelNode calcitePlan =
                         StageErrorHandler.executeStage(
                             QueryProcessingStage.PLAN_CONVERSION,
-                            () ->
-                                withCheckedArithmetic(
-                                    convertToCalcitePlan(relNode, context), context),
+                            () -> withCheckedArithmetic(convertToCalcitePlan(relNode, ctx), ctx),
                             "while converting the query to an executable plan");
 
-                    optimizedPlan = CalciteToolsHelper.optimize(calcitePlan, context);
+                    optimizedPlan = CalciteToolsHelper.optimize(calcitePlan, ctx);
                   }
                   executeCalcitePlan(optimizedPlan, context, listener);
                 },
