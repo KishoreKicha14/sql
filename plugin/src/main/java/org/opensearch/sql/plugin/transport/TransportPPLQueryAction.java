@@ -198,7 +198,7 @@ public class TransportPPLQueryAction
               new org.opensearch.core.action.NotifyOnceListener<>() {
                 @Override
                 protected void innerOnResponse(org.opensearch.tasks.Task task) {
-                  sendQueryInsightsReport((PPLQueryTask) task);
+                  writeQueryInsightsRecord((PPLQueryTask) task);
                 }
 
                 @Override
@@ -206,8 +206,9 @@ public class TransportPPLQueryAction
                   // Resource tracking failed to complete cleanly; nothing to report.
                 }
               });
-      if (!registered) {
-        LOG.debug("PPL task resource tracking already complete; skipping Query Insights report");
+      if (registered == false) {
+        LOG.debug(
+            "Query Insights report listener not registered; resource tracking already complete");
       }
     } catch (Exception e) {
       LOG.warn("Failed to register Query Insights report listener", e);
@@ -215,13 +216,17 @@ public class TransportPPLQueryAction
   }
 
   /**
-   * Build and best-effort send the {@link ReportQueryRequest} for a completed PPL query. Reads the
-   * finalized coordinator resource stats, the stashed query profile, and the query text. Any
-   * failure (including Query Insights not being installed) is swallowed.
+   * Best-effort: write a completed PPL query as a Query Insights top-queries record so it appears
+   * in the Query Insights historical Top N view. Reads the finalized coordinator resource stats,
+   * the stashed query profile, and the query text, then indexes a document directly into the Query
+   * Insights {@code top_queries-*} index (see {@link QueryInsightsIndexWriter} for why a direct
+   * index write rather than a transport call). Any failure — including Query Insights not being
+   * installed — is swallowed and never affects query execution.
    */
-  private void sendQueryInsightsReport(PPLQueryTask reportTask) {
+  private void writeQueryInsightsRecord(PPLQueryTask reportTask) {
     try {
       String coordinatorId = clusterServiceRef.localNode().getId() + ":" + reportTask.getId();
+      String nodeId = clusterServiceRef.localNode().getId();
       String queryText = stripPplPrefix(reportTask.getDescription());
 
       org.opensearch.core.tasks.resourcetracker.TaskResourceUsage usage =
@@ -231,7 +236,7 @@ public class TransportPPLQueryAction
 
       QueryProfile profile = reportTask.getQueryProfile();
       long latencyMillis = 0L;
-      java.util.List<ReportQueryRequest.PhaseMetric> phases = new java.util.ArrayList<>();
+      Map<String, Map<String, Object>> phases = new java.util.HashMap<>();
       if (profile != null) {
         if (profile.getSummary() != null) {
           latencyMillis = Math.round(profile.getSummary().getTotalTimeMillis());
@@ -240,32 +245,30 @@ public class TransportPPLQueryAction
           profile
               .getPhases()
               .forEach(
-                  (name, phase) ->
-                      phases.add(
-                          new ReportQueryRequest.PhaseMetric(
-                              name,
-                              phase.getTimeMillis(),
-                              phase.getCpuTimeMillis(),
-                              phase.getMemoryBytes())));
+                  (name, phase) -> {
+                    Map<String, Object> p = new java.util.HashMap<>();
+                    p.put("time_ms", phase.getTimeMillis());
+                    p.put("cpu_time_ms", phase.getCpuTimeMillis());
+                    p.put("memory_bytes", phase.getMemoryBytes());
+                    phases.put(name, p);
+                  });
         }
       }
 
-      ReportQueryRequest request =
-          new ReportQueryRequest(
-              "PPL",
-              coordinatorId,
-              queryText,
-              null,
-              latencyMillis,
-              cpuNanos,
-              memoryBytes,
-              System.currentTimeMillis(),
-              phases);
-
-      clientRef.execute(ReportQueryAction.INSTANCE, request, ActionListener.wrap(r -> {}, e -> {}));
+      QueryInsightsIndexWriter.write(
+          clientRef,
+          nodeId,
+          coordinatorId,
+          queryText,
+          System.currentTimeMillis(),
+          latencyMillis,
+          cpuNanos,
+          memoryBytes,
+          java.util.List.of(),
+          phases);
     } catch (Exception e) {
-      // Query Insights may not be installed, or the send may fail; never affect query execution.
-      LOG.debug("Failed to report PPL query to Query Insights", e);
+      // Query Insights may not be installed, or the write may fail; never affect query execution.
+      LOG.debug("Failed to write PPL query to Query Insights", e);
     }
   }
 

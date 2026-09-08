@@ -335,6 +335,18 @@ def getTelemetryOtelPlugin() {
 testClusters.integTest {
     plugin(getJobSchedulerPlugin())
     plugin(project.tasks.bundlePlugin.archiveFile)
+    // Local end-to-end testing: co-install the query-insights plugin so PPL Top N reporting can be
+    // exercised in one node. Toggle with: ./gradlew :opensearch-sql-plugin:run -DwithQueryInsights
+    // The zip is built separately: (cd ../query-insights && ./gradlew assemble)
+    if (System.getProperty("withQueryInsights") != null) {
+        plugin(provider(new java.util.concurrent.Callable<RegularFile>() {
+            @Override
+            RegularFile call() throws Exception {
+                return project.layout.projectDirectory.file(
+                    "${projectDir}/../../query-insights/build/distributions/query-insights-3.9.0.0-SNAPSHOT.zip")
+            }
+        }))
+    }
     testDistribution = "ARCHIVE"
 
     // debug with command, ./gradlew opensearch-sql:run -DdebugJVM. --debug-jvm does not work with keystore.
