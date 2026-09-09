@@ -21,6 +21,8 @@ import org.opensearch.sql.common.setting.Settings;
 import org.opensearch.sql.executor.QueryId;
 import org.opensearch.sql.executor.QueryManager;
 import org.opensearch.sql.executor.execution.AbstractPlan;
+import org.opensearch.sql.monitor.profile.ProfileCapturingTask;
+import org.opensearch.sql.monitor.profile.QueryProfiling;
 import org.opensearch.tasks.CancellableTask;
 import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
@@ -73,24 +75,63 @@ public class OpenSearchQueryManager implements QueryManager {
     cancellableTask.remove();
   }
 
+  /**
+   * Carries the Query Insights parent marker ({@code PPL:<nodeId>:<taskId>}) across the engine's
+   * thread hops, alongside {@link #cancellableTask}. Set by the SQL/PPL coordinator on the calling
+   * thread, re-established on the sql-worker pool by {@link #schedule}, and read by
+   * {@code BackgroundSearchScanner} so it can stamp the marker onto each child DSL search.
+   *
+   * <p>The engine hops from the coordinator thread to the sql-worker pool (which rebinds only the
+   * Log4j ThreadContext, not OpenSearch's header-carrying ThreadContext) and again to the
+   * sql_background_io pool. Reading the header off the OpenSearch ThreadContext at each hop is
+   * racy — Calcite may evaluate join sides / prefetch batches on threads that never received it. A
+   * dedicated ThreadLocal, propagated exactly like {@link #cancellableTask} (which reliably reaches
+   * the background pool today), makes child tagging deterministic.
+   */
+  private static final ThreadLocal<String> queryInsightsParentMarker = new ThreadLocal<>();
+
+  public static void setQueryInsightsParentMarker(String marker) {
+    queryInsightsParentMarker.set(marker);
+  }
+
+  public static String getQueryInsightsParentMarker() {
+    return queryInsightsParentMarker.get();
+  }
+
+  public static void clearQueryInsightsParentMarker() {
+    queryInsightsParentMarker.remove();
+  }
+
   @Override
   public QueryId submit(AbstractPlan queryPlan) {
     TimeValue timeout = settings.getSettingValue(Settings.Key.PPL_QUERY_TIMEOUT);
     CancellableTask cancelTask = cancellableTask.get();
     cancellableTask.remove();
-    schedule(nodeClient, queryPlan::execute, timeout, cancelTask);
+    // Capture the Query Insights parent marker on the coordinator thread (set there alongside the
+    // cancellable task) and carry it to the worker thread the same way, so child DSL searches this
+    // query spawns — including per-side join scans — are tagged deterministically.
+    String parentMarker = queryInsightsParentMarker.get();
+    queryInsightsParentMarker.remove();
+    schedule(nodeClient, queryPlan::execute, timeout, cancelTask, parentMarker);
 
     return queryPlan.getQueryId();
   }
 
   private void schedule(
-      NodeClient client, Runnable task, TimeValue timeout, CancellableTask cancelTask) {
+      NodeClient client,
+      Runnable task,
+      TimeValue timeout,
+      CancellableTask cancelTask,
+      String parentMarker) {
     ThreadPool threadPool = client.threadPool();
 
     Runnable wrappedTask =
         withCurrentContext(
             () -> {
               final Thread executionThread = Thread.currentThread();
+              // Re-establish the parent marker on this worker thread so downstream scans can read it
+              // (mirrors setCancellableTask below).
+              setQueryInsightsParentMarker(parentMarker);
 
               Scheduler.ScheduledCancellable timeoutTask =
                   threadPool.schedule(
@@ -139,7 +180,20 @@ public class OpenSearchQueryManager implements QueryManager {
                 if (trackResources) {
                   stopThreadResourceTracking(cancelTask, trackedThreadId);
                 }
+                // Capture the per-phase profile snapshot HERE, on the sql-worker execution thread,
+                // where the profiling ThreadLocal is still bound. The transport completion listener
+                // runs on a different thread where QueryProfiling.current() is the no-op context, so
+                // capturing there loses the phase breakdown. Stash it onto the task (if it opts in)
+                // for the completion listener to report to Query Insights. Best-effort.
+                if (cancelTask instanceof ProfileCapturingTask) {
+                  try {
+                    ((ProfileCapturingTask) cancelTask).setQueryProfile(QueryProfiling.current().finish());
+                  } catch (Exception e) {
+                    LOG.debug("Failed to capture query profile for Query Insights", e);
+                  }
+                }
                 clearCancellableTask();
+                clearQueryInsightsParentMarker();
               }
             });
 

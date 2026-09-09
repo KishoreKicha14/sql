@@ -119,6 +119,12 @@ public class ThreadPoolExecutionDispatcher implements ExecutionDispatcher {
               if (hookHandle != null) {
                 hookHandle.close();
               }
+              // Snapshot the per-phase profile for Query Insights BEFORE clearing, from the captured
+              // profileContext reference directly (not QueryProfiling.current(), which is unreliable
+              // across the engine's client.schedule hop). Captures the phases recorded into this
+              // context (prepare/analyze/optimize). See the note in captureProfileForQueryInsights
+              // about the execute/format phases.
+              captureProfileForQueryInsights(profileContext, cancellableTask);
               OpenSearchQueryManager.clearCancellableTask();
               RelMetadataQueryBase.THREAD_PROVIDERS.remove();
               CalcitePlanContext.clearTimewrapSignals();
@@ -129,7 +135,43 @@ public class ThreadPoolExecutionDispatcher implements ExecutionDispatcher {
           SQL_COMPLEX_WORKER_THREAD_POOL_NAME);
     } else {
       CalcitePlanContext.executionPool.set(SQL_WORKER_THREAD_POOL_NAME);
-      task.run();
+      ProfileContext fastPathProfile = QueryProfiling.current();
+      CancellableTask fastPathTask = OpenSearchQueryManager.getCancellableTask();
+      try {
+        task.run();
+      } finally {
+        captureProfileForQueryInsights(fastPathProfile, fastPathTask);
+      }
+    }
+  }
+
+  /**
+   * Finish the given profile context and stash the per-phase snapshot onto the task (if it opts in
+   * via {@link org.opensearch.sql.monitor.profile.ProfileCapturingTask}) for Query Insights. Uses
+   * the captured {@link ProfileContext} reference directly rather than the thread-local
+   * {@code QueryProfiling.current()}, which the engine's {@code client.schedule} hop leaves as the
+   * no-op context.
+   *
+   * <p><b>Known limitation:</b> the {@code prepare}, {@code analyze}, and {@code optimize} phases
+   * are recorded into this context and are captured here. The {@code execute} and {@code format}
+   * phases are recorded on the engine's {@code client.schedule} thread, whose
+   * {@code QueryProfiling.current()} is a separate no-op context, so they are not folded back into
+   * this context and currently report zero. Total query latency is measured independently (from the
+   * coordinator task start time) and is unaffected. Best-effort; never throws into the query path.
+   */
+  private static void captureProfileForQueryInsights(
+      ProfileContext profileContext, CancellableTask task) {
+    try {
+      if (profileContext == null
+          || (task instanceof org.opensearch.sql.monitor.profile.ProfileCapturingTask) == false) {
+        return;
+      }
+      org.opensearch.sql.monitor.profile.QueryProfile profile = profileContext.finish();
+      if (profile != null) {
+        ((org.opensearch.sql.monitor.profile.ProfileCapturingTask) task).setQueryProfile(profile);
+      }
+    } catch (Exception e) {
+      LOG.debug("Failed to capture query profile for Query Insights", e);
     }
   }
 

@@ -89,6 +89,7 @@ public class TransportPPLQueryAction
   private final NodeClient clientRef;
   private final ClusterService clusterServiceRef;
   private final org.opensearch.sql.common.setting.Settings pluginSettingsRef;
+  private final TransportService transportServiceRef;
 
   @Inject
   public TransportPPLQueryAction(
@@ -103,6 +104,7 @@ public class TransportPPLQueryAction
     super(PPLQueryAction.NAME, transportService, actionFilters, TransportPPLQueryRequest::new);
     this.clientRef = client;
     this.clusterServiceRef = clusterService;
+    this.transportServiceRef = transportService;
 
     ModulesBuilder modules = new ModulesBuilder();
     modules.add(new OpenSearchPluginModule(extensionsHolder.engines(), tracer));
@@ -173,12 +175,18 @@ public class TransportPPLQueryAction
     try {
       org.opensearch.common.util.concurrent.ThreadContext threadContext =
           clientRef.threadPool().getThreadContext();
+      String value =
+          QueryInsightsMarker.value(
+              "PPL", clusterServiceRef.localNode().getId(), pplQueryTask.getId());
       if (threadContext.getHeader(QueryInsightsMarker.PARENT_HEADER) == null) {
-        String value =
-            QueryInsightsMarker.value(
-                "PPL", clusterServiceRef.localNode().getId(), pplQueryTask.getId());
         threadContext.putHeader(QueryInsightsMarker.PARENT_HEADER, value);
       }
+      // Also carry the marker on the engine's ThreadLocal channel (alongside the cancellable task),
+      // so child DSL searches spawned on the background scan pool are tagged deterministically. The
+      // OpenSearch ThreadContext header alone does not survive the engine's thread hops (sql-worker
+      // -> sql_background_io), which caused intermittent child capture for join scans.
+      org.opensearch.sql.opensearch.executor.OpenSearchQueryManager.setQueryInsightsParentMarker(
+          value);
     } catch (Exception e) {
       LOG.warn("Failed to stamp Query Insights parent header for query association", e);
     }
@@ -191,6 +199,51 @@ public class TransportPPLQueryAction
    * getTotalResourceStats()} is finalized when it runs. Best-effort: if tracking is already
    * complete (listener not accepted) or the report fails, query execution is unaffected.
    */
+  /**
+   * Query Insights owns the operator-facing toggle for recording PPL queries into Top N. It is a
+   * dynamic cluster setting registered by the Query Insights plugin under this key; the two plugins
+   * do not share classes, so the key string is the contract between them. Since this plugin does not
+   * register the setting, its value is read directly from cluster state (transient overrides
+   * persistent). Default false when unset or Query Insights is not installed. Read fresh per query so
+   * the toggle takes effect at runtime. Defensive: any read failure defaults to disabled.
+   */
+  static final String QUERY_INSIGHTS_PPL_ENABLED_KEY = "search.insights.top_queries.ppl.enabled";
+
+  /**
+   * Records a completed PPL query into Query Insights only when BOTH hold:
+   *
+   * <ol>
+   *   <li><b>Query Insights is installed.</b> Detected by whether the setting key above is
+   *       registered in this node's {@link org.opensearch.common.settings.ClusterSettings}. That
+   *       setting is registered by the Query Insights plugin, so its presence is an exact,
+   *       zero-cost, local signal that Query Insights is on the node. If Query Insights is absent
+   *       the key is unregistered (and cannot even be set), so this returns false and we never write
+   *       to an index no one reads.
+   *   <li><b>Recording is enabled.</b> The dynamic setting value is {@code true} (default false),
+   *       read fresh from cluster state so the operator toggle takes effect at runtime.
+   * </ol>
+   *
+   * Defensive: any failure defaults to disabled so reporting never affects query execution.
+   */
+  private boolean isQueryInsightsRecordingEnabled() {
+    try {
+      // (1) Query Insights installed? The setting is registered iff Query Insights is present.
+      if (clusterServiceRef.getClusterSettings().get(QUERY_INSIGHTS_PPL_ENABLED_KEY) == null) {
+        return false;
+      }
+      // (2) Recording enabled? Transient overrides persistent; absent → false.
+      org.opensearch.common.settings.Settings persistent =
+          clusterServiceRef.state().metadata().persistentSettings();
+      org.opensearch.common.settings.Settings transientSettings =
+          clusterServiceRef.state().metadata().transientSettings();
+      boolean fromPersistent = persistent.getAsBoolean(QUERY_INSIGHTS_PPL_ENABLED_KEY, false);
+      return transientSettings.getAsBoolean(QUERY_INSIGHTS_PPL_ENABLED_KEY, fromPersistent);
+    } catch (Exception e) {
+      LOG.debug("Failed to evaluate Query Insights PPL recording gate; defaulting to disabled", e);
+      return false;
+    }
+  }
+
   private void registerQueryInsightsReport(PPLQueryTask reportTask) {
     try {
       boolean registered =
@@ -216,16 +269,17 @@ public class TransportPPLQueryAction
   }
 
   /**
-   * Best-effort: write a completed PPL query as a Query Insights top-queries record so it appears
-   * in the Query Insights historical Top N view. Reads the finalized coordinator resource stats,
-   * the stashed query profile, and the query text, then indexes a document directly into the Query
-   * Insights {@code top_queries-*} index (see {@link QueryInsightsIndexWriter} for why a direct
-   * index write rather than a transport call). Any failure — including Query Insights not being
-   * installed — is swallowed and never affects query execution.
+   * Best-effort: report a completed PPL query to Query Insights so it appears in the Query Insights
+   * in-memory Top N (and, on window rotation, the historical index) with its child DSL searches
+   * rolled up. Reads the finalized coordinator resource stats, the stashed query profile, and the
+   * query text, then serializes them and sends them to Query Insights over the transport layer as a
+   * core {@link org.opensearch.transport.BytesTransportRequest} (see {@link QueryInsightsReporter}
+   * for why a transport send of a core request type). Any failure — including Query Insights not
+   * being installed, so the action is unregistered — is swallowed and never affects query
+   * execution.
    */
   private void writeQueryInsightsRecord(PPLQueryTask reportTask) {
     try {
-      String coordinatorId = clusterServiceRef.localNode().getId() + ":" + reportTask.getId();
       String nodeId = clusterServiceRef.localNode().getId();
       String queryText = stripPplPrefix(reportTask.getDescription());
 
@@ -234,13 +288,17 @@ public class TransportPPLQueryAction
       long cpuNanos = usage == null ? 0L : usage.getCpuTimeInNanos();
       long memoryBytes = usage == null ? 0L : usage.getMemoryInBytes();
 
+      // End-to-end wall-clock latency measured at the coordinator: the task's start time (set at
+      // registration, i.e. query start) to now (this listener fires when the query has finished).
+      // This is used instead of the query profile's total time, because the profile total is
+      // computed from a thread-local profiling context and collapses to ~0 when finish() resolves
+      // on a different thread than the one activated at query start. getStartTimeNanos() is a
+      // monotonic clock, so the delta is a reliable elapsed duration.
+      long latencyMillis = Math.max(0L, (System.nanoTime() - reportTask.getStartTimeNanos()) / 1_000_000L);
+
       QueryProfile profile = reportTask.getQueryProfile();
-      long latencyMillis = 0L;
       Map<String, Map<String, Object>> phases = new java.util.HashMap<>();
       if (profile != null) {
-        if (profile.getSummary() != null) {
-          latencyMillis = Math.round(profile.getSummary().getTotalTimeMillis());
-        }
         if (profile.getPhases() != null) {
           profile
               .getPhases()
@@ -255,17 +313,32 @@ public class TransportPPLQueryAction
         }
       }
 
-      QueryInsightsIndexWriter.write(
-          clientRef,
+      // The parent marker MUST equal the value stamped into the child DSL task header
+      // (QueryInsightsMarker.value), so Query Insights can roll child CPU/memory into this parent:
+      // child DERIVED_FROM == this parent's marker. It is the qualified "<source>:<nodeId>:<taskId>",
+      // not the bare "<nodeId>:<taskId>" coordinatorId.
+      String parentMarker = QueryInsightsMarker.value("PPL", nodeId, reportTask.getId());
+
+      // Shape hash for SIMILARITY grouping: normalize the query text (strip literals, collapse
+      // whitespace) and hash it, namespaced with a "ppl:" prefix so PPL groups never collide with
+      // DSL query-shape groups. Best-effort; empty when the text is unavailable.
+      String queryShapeHash = pplShapeHash(queryText);
+
+      // Hand the record to Query Insights over the transport layer (core BytesTransportRequest), so
+      // it flows through the in-memory addRecord pipeline: in-memory Top N + historical + roll-up.
+      QueryInsightsReporter.report(
+          transportServiceRef,
+          clusterServiceRef.localNode(),
+          "PPL",
+          parentMarker,
           nodeId,
-          coordinatorId,
           queryText,
           System.currentTimeMillis(),
           latencyMillis,
           cpuNanos,
           memoryBytes,
-          java.util.List.of(),
-          phases);
+          phases,
+          queryShapeHash);
     } catch (Exception e) {
       // Query Insights may not be installed, or the write may fail; never affect query execution.
       LOG.debug("Failed to write PPL query to Query Insights", e);
@@ -282,6 +355,38 @@ public class TransportPPLQueryAction
       return description.substring(colon + 2);
     }
     return description;
+  }
+
+  /**
+   * Compute a stable "shape" hash for a PPL query so that queries differing only in literal values
+   * group together under Query Insights SIMILARITY grouping — the PPL analogue of the DSL query
+   * shape. This is a v1 text-normalization heuristic (not an AST walk): it lowercases, strips
+   * quoted string and numeric literals to a {@code ?} placeholder, and collapses whitespace, then
+   * hashes the result. Two PPL queries with the same command pipeline but different filter/values
+   * (e.g. {@code where dept="eng"} vs {@code where dept="sales"}) yield the same hash.
+   *
+   * <p>The hash is namespaced with a {@code "ppl:"} prefix so a PPL shape never collides with a DSL
+   * query-shape hash (which is a bare hex string), keeping PPL and DSL similarity groups distinct.
+   *
+   * @param queryText the prefix-stripped PPL query text
+   * @return {@code "ppl:<hash>"}, or empty string when the text is null/blank
+   */
+  static String pplShapeHash(String queryText) {
+    if (queryText == null || queryText.trim().isEmpty()) {
+      return "";
+    }
+    String normalized =
+        queryText
+            .toLowerCase(java.util.Locale.ROOT)
+            // Double- and single-quoted string literals -> ?
+            .replaceAll("\"[^\"]*\"", "?")
+            .replaceAll("'[^']*'", "?")
+            // Numeric literals (including decimals) -> ?
+            .replaceAll("\\b\\d+(?:\\.\\d+)?\\b", "?")
+            // Collapse all whitespace runs to a single space
+            .replaceAll("\\s+", " ")
+            .trim();
+    return "ppl:" + Integer.toHexString(normalized.hashCode());
   }
 
   /**
@@ -310,8 +415,13 @@ public class TransportPPLQueryAction
     final PPLQueryTask reportTask = task instanceof PPLQueryTask ? (PPLQueryTask) task : null;
     if (reportTask != null) {
       OpenSearchQueryManager.setCancellableTask(reportTask);
-      stampQueryInsightsParentHeader(reportTask);
-      registerQueryInsightsReport(reportTask);
+      // Recording PPL queries into Query Insights (Top N) is opt-in via a dynamic cluster setting.
+      // When disabled, we neither stamp the parent header (so child DSL searches are not tagged)
+      // nor register the report writer — zero Query Insights side effects.
+      if (isQueryInsightsRecordingEnabled()) {
+        stampQueryInsightsParentHeader(reportTask);
+        registerQueryInsightsReport(reportTask);
+      }
     }
     Metrics.getInstance().getNumericalMetric(MetricName.PPL_REQ_TOTAL).increment();
     Metrics.getInstance().getNumericalMetric(MetricName.PPL_REQ_COUNT_TOTAL).increment();
@@ -546,20 +656,20 @@ public class TransportPPLQueryAction
   }
 
   /**
-   * Snapshot the per-phase profile onto the coordinator task (so the resource-tracking completion
-   * listener can report it to Query Insights), then clear the profiling thread-local. Runs on the
-   * execution thread where the profile is still bound. Best-effort: never throws into the response
-   * path.
+   * Clear any profiling thread-local bound to the current thread.
+   *
+   * <p>The per-phase profile is now captured on the {@code sql-worker} execution thread (in
+   * {@code OpenSearchQueryManager}, where the profiling context is actually bound) and stashed onto
+   * the task via {@link org.opensearch.sql.monitor.profile.ProfileCapturingTask}. This method must
+   * NOT re-stash from here: it runs on the response-completion thread, where
+   * {@code QueryProfiling.current()} is the no-op context, and stashing it would overwrite the good
+   * capture with an empty profile. It only clears, as a defensive cleanup. Best-effort.
    */
   private void stashProfileThenClear(PPLQueryTask reportTask) {
     try {
-      if (reportTask != null) {
-        reportTask.setQueryProfile(QueryProfiling.current().finish());
-      }
-    } catch (Exception e) {
-      LOG.warn("Failed to capture PPL query profile for Query Insights", e);
-    } finally {
       QueryProfiling.clear();
+    } catch (Exception e) {
+      LOG.debug("Failed to clear PPL query profiling context", e);
     }
   }
 }

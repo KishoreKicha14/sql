@@ -63,7 +63,9 @@ import org.opensearch.sql.executor.pagination.PlanSerializer;
 import org.opensearch.sql.expression.function.BuiltinFunctionName;
 import org.opensearch.sql.expression.function.PPLFuncImpTable;
 import org.opensearch.sql.monitor.profile.MetricName;
+import org.opensearch.sql.monitor.profile.ProfileContext;
 import org.opensearch.sql.monitor.profile.ProfileScope;
+import org.opensearch.sql.monitor.profile.QueryProfiling;
 import org.opensearch.sql.opensearch.client.OpenSearchClient;
 import org.opensearch.sql.opensearch.data.value.OpenSearchExprGeoPointValue;
 import org.opensearch.sql.opensearch.executor.protector.ExecutionProtector;
@@ -329,6 +331,15 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
       RelNode rel, CalcitePlanContext context, ResponseListener<QueryResponse> listener) {
     client.schedule(
         () -> {
+          // Re-bind the query's profiling context (carried on the plan context) onto THIS execution
+          // thread, so the EXECUTE phase records into the same context as PREPARE/ANALYZE/OPTIMIZE.
+          // Without this, QueryProfiling.current() here is the no-op context and the EXECUTE metric
+          // is discarded. Restore the thread's previous binding afterward to keep the pool clean.
+          final ProfileContext queryProfile = context.getProfileContext();
+          final ProfileContext previousProfile = QueryProfiling.current();
+          if (queryProfile != null) {
+            QueryProfiling.set(queryProfile);
+          }
           try (PreparedStatement statement = OpenSearchRelRunners.run(context, rel)) {
             QueryResponse response;
             try (ProfileScope executePhase = ProfileScope.open(MetricName.EXECUTE)) {
@@ -353,6 +364,11 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
                   .build();
             }
             throw new RuntimeException(e);
+          } finally {
+            // Restore the thread's previous profiling binding.
+            if (queryProfile != null) {
+              QueryProfiling.set(previousProfile);
+            }
           }
         });
   }

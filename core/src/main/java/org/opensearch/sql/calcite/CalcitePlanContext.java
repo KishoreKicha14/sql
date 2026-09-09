@@ -87,6 +87,15 @@ public class CalcitePlanContext {
    */
   @Getter @Setter private boolean includeMetadata = false;
 
+  /**
+   * The query's profiling context, captured at activation. Carried on this object (which travels
+   * with the query into the execution engine) so the engine can re-bind it onto its execution
+   * thread and record the EXECUTE phase into the same context as PREPARE/ANALYZE/OPTIMIZE — the
+   * engine's execution thread otherwise sees the no-op profiling context.
+   */
+  @Getter @Setter
+  private transient org.opensearch.sql.monitor.profile.ProfileContext profileContext;
+
   private final Stack<RexCorrelVariable> correlVar = new Stack<>();
   private final Stack<List<RexNode>> windowPartitions = new Stack<>();
 

@@ -239,6 +239,10 @@ public class QueryService {
                             includeMetadata);
 
                     context.setHighlightConfig(highlightConfig);
+                    // Carry the active profiling context on the plan context so the execution
+                    // engine can re-bind it on its own thread and record the EXECUTE phase into the
+                    // same context as the planning phases (see CalcitePlanContext#profileContext).
+                    context.setProfileContext(QueryProfiling.current());
                   }
 
                   final CalcitePlanContext ctx = context;

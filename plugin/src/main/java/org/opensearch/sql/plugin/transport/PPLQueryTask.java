@@ -7,10 +7,11 @@ package org.opensearch.sql.plugin.transport;
 
 import java.util.Map;
 import org.opensearch.core.tasks.TaskId;
+import org.opensearch.sql.monitor.profile.ProfileCapturingTask;
 import org.opensearch.sql.monitor.profile.QueryProfile;
 import org.opensearch.tasks.CancellableTask;
 
-public class PPLQueryTask extends CancellableTask {
+public class PPLQueryTask extends CancellableTask implements ProfileCapturingTask {
 
   /**
    * Per-phase profile snapshot for this query, stashed on the execution thread just before the
@@ -51,6 +52,7 @@ public class PPLQueryTask extends CancellableTask {
     return queryProfile;
   }
 
+  @Override
   public void setQueryProfile(QueryProfile queryProfile) {
     this.queryProfile = queryProfile;
   }

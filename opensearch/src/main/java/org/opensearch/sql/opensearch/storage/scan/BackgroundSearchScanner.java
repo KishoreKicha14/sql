@@ -66,6 +66,18 @@ import org.opensearch.tasks.CancellableTask;
  * cleanup.
  */
 public class BackgroundSearchScanner {
+  /**
+   * Name of the task header that links a child DSL search back to the originating SQL/PPL query for
+   * Query Insights. This MUST match {@code QueryInsightsMarker.PARENT_HEADER} in the {@code plugin}
+   * module and the header name Query Insights reads; it is duplicated as a literal here because the
+   * {@code opensearch} module does not (and should not) depend on {@code plugin}. OpenSearch copies
+   * this registered header from a thread's ThreadContext onto the child SearchTask it spawns — but
+   * only from the thread that issues the search. Background scans run on a pooled thread that does
+   * not inherit the coordinator's ThreadContext, so we capture the header on the calling thread and
+   * re-apply it on the pool thread around the search (see {@link #searchWithTask}).
+   */
+  private static final String QUERY_INSIGHTS_PARENT_HEADER = "X-Query-Insights-Parent";
+
   private final OpenSearchClient client;
   @Nullable private final Executor backgroundExecutor;
   private CompletableFuture<OpenSearchResponse> nextBatchFuture = null;
@@ -112,11 +124,29 @@ public class BackgroundSearchScanner {
       // re-establish it. Without this, applyParentTask() in OpenSearchNodeClient sees a null task
       // on the background pool and the prefetched DSL search task loses its parent (SQL/PPL) link.
       CancellableTask task = OpenSearchQueryManager.getCancellableTask();
+      // Capture the Query Insights parent-marker header the same way, so the child DSL search
+      // spawned on the pooled thread is tagged as derived from this SQL/PPL query (see field doc).
+      String parentMarker = currentQueryInsightsParentHeader();
       nextBatchFuture =
           CompletableFuture.supplyAsync(
-              () -> QueryProfiling.withCurrentContext(ctx, () -> searchWithTask(request, task)),
+              () ->
+                  QueryProfiling.withCurrentContext(
+                      ctx, () -> searchWithTask(request, task, parentMarker)),
               backgroundExecutor);
     }
+  }
+
+  /**
+   * Read the Query Insights parent marker carried on the calling (engine worker) thread, or
+   * {@code null} if absent (non-SQL/PPL query, or recording disabled). This rides the same
+   * ThreadLocal channel as the cancellable task, which reliably reaches the engine worker thread —
+   * unlike the OpenSearch ThreadContext header, which is not propagated across the engine's thread
+   * hops. Captured here on the calling thread and re-applied on the background pool thread in
+   * {@link #searchWithParentHeader}.
+   */
+  @Nullable
+  private String currentQueryInsightsParentHeader() {
+    return OpenSearchQueryManager.getQueryInsightsParentMarker();
   }
 
   /**
@@ -125,20 +155,42 @@ public class BackgroundSearchScanner {
    * thread's previous task afterward to keep the shared background pool clean.
    */
   private OpenSearchResponse searchWithTask(
-      OpenSearchRequest request, @Nullable CancellableTask task) {
+      OpenSearchRequest request, @Nullable CancellableTask task, @Nullable String parentMarker) {
     if (task == null) {
-      return client.search(request);
+      return searchWithParentHeader(request, parentMarker);
     }
     CancellableTask previous = OpenSearchQueryManager.getCancellableTask();
     OpenSearchQueryManager.setCancellableTask(task);
     try {
-      return client.search(request);
+      return searchWithParentHeader(request, parentMarker);
     } finally {
       if (previous != null) {
         OpenSearchQueryManager.setCancellableTask(previous);
       } else {
         OpenSearchQueryManager.clearCancellableTask();
       }
+    }
+  }
+
+  /**
+   * Runs {@code client.search} with the Query Insights parent-marker header re-applied to this
+   * (pooled) thread's OpenSearch ThreadContext, so OpenSearch stamps it onto the child SearchTask
+   * and Query Insights can associate the child DSL search with its SQL/PPL parent. A fresh stored
+   * context is stashed and restored around the call so the shared background pool thread is left
+   * clean and we never hit "header already exists". Falls back to a plain search when there is no
+   * marker or no node client.
+   */
+  private OpenSearchResponse searchWithParentHeader(
+      OpenSearchRequest request, @Nullable String parentMarker) {
+    if (parentMarker == null || parentMarker.isEmpty() || client.getNodeClient().isEmpty()) {
+      return client.search(request);
+    }
+    org.opensearch.common.util.concurrent.ThreadContext threadContext =
+        client.getNodeClient().get().threadPool().getThreadContext();
+    try (org.opensearch.common.util.concurrent.ThreadContext.StoredContext ignored =
+        threadContext.stashContext()) {
+      threadContext.putHeader(QUERY_INSIGHTS_PARENT_HEADER, parentMarker);
+      return client.search(request);
     }
   }
 
@@ -206,8 +258,10 @@ public class BackgroundSearchScanner {
       // Pre-fetch next batch if needed
       if (!stopIteration && isAsync()) {
         CancellableTask task = OpenSearchQueryManager.getCancellableTask();
+        String parentMarker = currentQueryInsightsParentHeader();
         nextBatchFuture =
-            CompletableFuture.supplyAsync(() -> searchWithTask(request, task), backgroundExecutor);
+            CompletableFuture.supplyAsync(
+                () -> searchWithTask(request, task, parentMarker), backgroundExecutor);
       }
     } else {
       iterator = Collections.emptyIterator();
