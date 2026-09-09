@@ -319,10 +319,10 @@ public class TransportPPLQueryAction
       // not the bare "<nodeId>:<taskId>" coordinatorId.
       String parentMarker = QueryInsightsMarker.value("PPL", nodeId, reportTask.getId());
 
-      // Shape hash for SIMILARITY grouping: normalize the query text (strip literals, collapse
-      // whitespace) and hash it, namespaced with a "ppl:" prefix so PPL groups never collide with
-      // DSL query-shape groups. Best-effort; empty when the text is unavailable.
-      String queryShapeHash = pplShapeHash(queryText);
+      // Shape hash for SIMILARITY grouping is intentionally empty for now: PPL/SQL similarity
+      // grouping is deferred (the implementation lives on feat/ppl-query-insights-grouping). The
+      // field is still sent to keep the wire format aligned with the Query Insights handler.
+      String queryShapeHash = "";
 
       // Hand the record to Query Insights over the transport layer (core BytesTransportRequest), so
       // it flows through the in-memory addRecord pipeline: in-memory Top N + historical + roll-up.
@@ -355,38 +355,6 @@ public class TransportPPLQueryAction
       return description.substring(colon + 2);
     }
     return description;
-  }
-
-  /**
-   * Compute a stable "shape" hash for a PPL query so that queries differing only in literal values
-   * group together under Query Insights SIMILARITY grouping — the PPL analogue of the DSL query
-   * shape. This is a v1 text-normalization heuristic (not an AST walk): it lowercases, strips
-   * quoted string and numeric literals to a {@code ?} placeholder, and collapses whitespace, then
-   * hashes the result. Two PPL queries with the same command pipeline but different filter/values
-   * (e.g. {@code where dept="eng"} vs {@code where dept="sales"}) yield the same hash.
-   *
-   * <p>The hash is namespaced with a {@code "ppl:"} prefix so a PPL shape never collides with a DSL
-   * query-shape hash (which is a bare hex string), keeping PPL and DSL similarity groups distinct.
-   *
-   * @param queryText the prefix-stripped PPL query text
-   * @return {@code "ppl:<hash>"}, or empty string when the text is null/blank
-   */
-  static String pplShapeHash(String queryText) {
-    if (queryText == null || queryText.trim().isEmpty()) {
-      return "";
-    }
-    String normalized =
-        queryText
-            .toLowerCase(java.util.Locale.ROOT)
-            // Double- and single-quoted string literals -> ?
-            .replaceAll("\"[^\"]*\"", "?")
-            .replaceAll("'[^']*'", "?")
-            // Numeric literals (including decimals) -> ?
-            .replaceAll("\\b\\d+(?:\\.\\d+)?\\b", "?")
-            // Collapse all whitespace runs to a single space
-            .replaceAll("\\s+", " ")
-            .trim();
-    return "ppl:" + Integer.toHexString(normalized.hashCode());
   }
 
   /**
