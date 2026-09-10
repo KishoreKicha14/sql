@@ -219,11 +219,11 @@ public class QueryService {
     CalcitePlanContext.run(
         () -> {
           try {
-            // Profiling is always active on the Calcite path so the per-phase CPU/memory
-            // breakdown is available for Query Insights on every query, not only when the
-            // request explicitly asked to profile. The extra cost is a handful of ThreadMXBean
-            // samples at phase boundaries.
-            QueryProfiling.activate(true);
+            // Always collect the cheap per-phase resource metrics (time/CPU/memory) so Query
+            // Insights gets the per-phase breakdown on every query, with no dependence on the
+            // profile request flag. Enable the expensive per-operator plan-node profiling only when
+            // the request explicitly asked for it (profile=true).
+            QueryProfiling.activate(true, QueryContext.isProfileEnabled());
             CalciteClassLoaderHelper.withCalciteClassLoader(
                 () -> {
                   CalcitePlanContext context;

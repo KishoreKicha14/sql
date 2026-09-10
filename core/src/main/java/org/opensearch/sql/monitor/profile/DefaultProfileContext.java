@@ -21,7 +21,25 @@ public class DefaultProfileContext implements ProfileContext {
   private Object enginePlan;
   private QueryProfile profile;
 
-  public DefaultProfileContext() {}
+  /**
+   * When true, the expensive per-operator plan-node profiling is enabled (plan tree rewritten with
+   * profiling wrappers). Per-phase metrics (time/CPU/memory) are always collected regardless of
+   * this flag; only the plan-node instrumentation is gated on it.
+   */
+  private final boolean planProfiling;
+
+  public DefaultProfileContext() {
+    this(false);
+  }
+
+  public DefaultProfileContext(boolean planProfiling) {
+    this.planProfiling = planProfiling;
+  }
+
+  @Override
+  public boolean isPlanProfilingEnabled() {
+    return planProfiling;
+  }
 
   @Override
   public boolean isEnabled() {

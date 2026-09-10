@@ -331,10 +331,13 @@ public class OpenSearchExecutionEngine implements ExecutionEngine {
       RelNode rel, CalcitePlanContext context, ResponseListener<QueryResponse> listener) {
     client.schedule(
         () -> {
-          // Re-bind the query's profiling context (carried on the plan context) onto THIS execution
-          // thread, so the EXECUTE phase records into the same context as PREPARE/ANALYZE/OPTIMIZE.
-          // Without this, QueryProfiling.current() here is the no-op context and the EXECUTE metric
-          // is discarded. Restore the thread's previous binding afterward to keep the pool clean.
+          // Bind the query's profiling context (carried on the plan context) onto this thread so
+          // the
+          // EXECUTE phase records into the same context as PREPARE/ANALYZE/OPTIMIZE. The current
+          // client.schedule implementations run this block inline on the sql-worker thread, where
+          // that context is already bound, so this is normally a no-op; it is kept defensively so
+          // the EXECUTE metric is still captured correctly should scheduling ever move to a
+          // different thread. The previous binding is restored afterward to keep the pool clean.
           final ProfileContext queryProfile = context.getProfileContext();
           final ProfileContext previousProfile = QueryProfiling.current();
           if (queryProfile != null) {

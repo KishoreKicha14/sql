@@ -78,13 +78,13 @@ public class OpenSearchQueryManager implements QueryManager {
   /**
    * Carries the Query Insights parent marker ({@code PPL:<nodeId>:<taskId>}) across the engine's
    * thread hops, alongside {@link #cancellableTask}. Set by the SQL/PPL coordinator on the calling
-   * thread, re-established on the sql-worker pool by {@link #schedule}, and read by
-   * {@code BackgroundSearchScanner} so it can stamp the marker onto each child DSL search.
+   * thread, re-established on the sql-worker pool by {@link #schedule}, and read by {@code
+   * BackgroundSearchScanner} so it can stamp the marker onto each child DSL search.
    *
    * <p>The engine hops from the coordinator thread to the sql-worker pool (which rebinds only the
    * Log4j ThreadContext, not OpenSearch's header-carrying ThreadContext) and again to the
-   * sql_background_io pool. Reading the header off the OpenSearch ThreadContext at each hop is
-   * racy — Calcite may evaluate join sides / prefetch batches on threads that never received it. A
+   * sql_background_io pool. Reading the header off the OpenSearch ThreadContext at each hop is racy
+   * — Calcite may evaluate join sides / prefetch batches on threads that never received it. A
    * dedicated ThreadLocal, propagated exactly like {@link #cancellableTask} (which reliably reaches
    * the background pool today), makes child tagging deterministic.
    */
@@ -129,7 +129,8 @@ public class OpenSearchQueryManager implements QueryManager {
         withCurrentContext(
             () -> {
               final Thread executionThread = Thread.currentThread();
-              // Re-establish the parent marker on this worker thread so downstream scans can read it
+              // Re-establish the parent marker on this worker thread so downstream scans can read
+              // it
               // (mirrors setCancellableTask below).
               setQueryInsightsParentMarker(parentMarker);
 
@@ -180,20 +181,24 @@ public class OpenSearchQueryManager implements QueryManager {
                 if (trackResources) {
                   stopThreadResourceTracking(cancelTask, trackedThreadId);
                 }
-                // Capture the per-phase profile snapshot HERE, on the sql-worker execution thread,
-                // where the profiling ThreadLocal is still bound. The transport completion listener
-                // runs on a different thread where QueryProfiling.current() is the no-op context, so
-                // capturing there loses the phase breakdown. Stash it onto the task (if it opts in)
-                // for the completion listener to report to Query Insights. Best-effort.
+                // Capture the per-phase profile snapshot here, on the sql-worker execution thread
+                // where the profiling ThreadLocal is bound, and stash it onto the task (if it opts
+                // in) so the Query Insights completion listener can report it. finish() is
+                // idempotent, so this is safe even if a snapshot was already taken earlier in the
+                // pipeline. Best-effort.
                 if (cancelTask instanceof ProfileCapturingTask) {
                   try {
-                    ((ProfileCapturingTask) cancelTask).setQueryProfile(QueryProfiling.current().finish());
+                    ((ProfileCapturingTask) cancelTask)
+                        .setQueryProfile(QueryProfiling.current().finish());
                   } catch (Exception e) {
                     LOG.debug("Failed to capture query profile for Query Insights", e);
                   }
                 }
                 clearCancellableTask();
                 clearQueryInsightsParentMarker();
+                // Release the profiling context bound to this pooled sql-worker thread so it is not
+                // retained until the next query on the same thread overwrites it.
+                QueryProfiling.clear();
               }
             });
 

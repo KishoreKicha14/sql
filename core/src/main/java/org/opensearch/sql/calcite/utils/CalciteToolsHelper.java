@@ -325,7 +325,10 @@ public class CalciteToolsHelper {
     @Override
     protected PreparedResult implement(RelRoot root) {
       ProfileContext profileContext = QueryProfiling.current();
-      if (profileContext.isEnabled()) {
+      // Only wrap the plan with per-operator profiling nodes when full plan profiling was requested
+      // (profile=true). This per-node, per-row instrumentation is the expensive part of profiling
+      // and is independent of the always-on per-phase resource metrics, which do not require it.
+      if (profileContext.isPlanProfilingEnabled()) {
         PlanProfileBuilder.ProfilePlan plan = PlanProfileBuilder.profile(root.rel);
         profileContext.setPlanRoot(plan.planRoot());
         root = root.withRel(plan.rel());

@@ -398,6 +398,10 @@ public class TransportPPLQueryAction
 
     // in order to use PPL service, we need to convert TransportPPLQueryRequest to PPLQueryRequest
     PPLQueryRequest transformedRequest = transportRequest.toPPLQueryRequest();
+    // Only the request's own profile flag controls the expensive per-operator plan-node profiling.
+    // Query Insights does NOT need to force it: per-phase time/CPU/memory is captured by the cheap
+    // always-on phase metrics in QueryService, and query-total CPU/memory comes from the task
+    // resource-tracking framework — all without plan-node instrumentation.
     QueryContext.setProfile(transformedRequest.profile());
 
     // Start root span with OTel DB semantic convention attributes

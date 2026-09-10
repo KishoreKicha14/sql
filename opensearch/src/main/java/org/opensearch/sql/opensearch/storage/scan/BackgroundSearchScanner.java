@@ -137,12 +137,12 @@ public class BackgroundSearchScanner {
   }
 
   /**
-   * Read the Query Insights parent marker carried on the calling (engine worker) thread, or
-   * {@code null} if absent (non-SQL/PPL query, or recording disabled). This rides the same
-   * ThreadLocal channel as the cancellable task, which reliably reaches the engine worker thread —
-   * unlike the OpenSearch ThreadContext header, which is not propagated across the engine's thread
-   * hops. Captured here on the calling thread and re-applied on the background pool thread in
-   * {@link #searchWithParentHeader}.
+   * Read the Query Insights parent marker carried on the calling (engine worker) thread, or {@code
+   * null} if absent (non-SQL/PPL query, or recording disabled). This rides the same ThreadLocal
+   * channel as the cancellable task, which reliably reaches the engine worker thread — unlike the
+   * OpenSearch ThreadContext header, which is not propagated across the engine's thread hops.
+   * Captured here on the calling thread and re-applied on the background pool thread in {@link
+   * #searchWithParentHeader}.
    */
   @Nullable
   private String currentQueryInsightsParentHeader() {

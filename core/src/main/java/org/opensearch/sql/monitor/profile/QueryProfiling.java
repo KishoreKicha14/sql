@@ -44,8 +44,25 @@ public final class QueryProfiling {
    * @return newly activated profiling context
    */
   public static ProfileContext activate(boolean profilingEnabled) {
-    if (profilingEnabled) {
-      CURRENT.set(new DefaultProfileContext());
+    return activate(profilingEnabled, profilingEnabled);
+  }
+
+  /**
+   * Activate profiling for the current thread with independent control over per-phase capture and
+   * the expensive per-operator plan-node profiling.
+   *
+   * <p>Per-phase resource capture (time/CPU/memory) is cheap and can be left on for every query so
+   * Query Insights always gets the per-phase breakdown. Plan-node profiling rewrites the plan with
+   * per-operator instrumentation that records per-node time/rows on every row iteration — the
+   * expensive part — and should be enabled only when the user requested {@code profile=true}.
+   *
+   * @param phaseCaptureEnabled whether to collect cheap per-phase time/CPU/memory metrics
+   * @param planProfilingEnabled whether to also enable the expensive per-operator plan profiling
+   * @return newly activated profiling context
+   */
+  public static ProfileContext activate(boolean phaseCaptureEnabled, boolean planProfilingEnabled) {
+    if (phaseCaptureEnabled) {
+      CURRENT.set(new DefaultProfileContext(planProfilingEnabled));
     } else {
       CURRENT.set(NoopProfileContext.INSTANCE);
     }
