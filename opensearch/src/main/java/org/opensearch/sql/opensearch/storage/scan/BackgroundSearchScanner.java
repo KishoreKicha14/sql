@@ -12,6 +12,7 @@ import java.util.Iterator;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
+import java.util.function.Supplier;
 import javax.annotation.Nullable;
 import org.opensearch.OpenSearchException;
 import org.opensearch.OpenSearchSecurityException;
@@ -21,8 +22,10 @@ import org.opensearch.sql.exception.NonFallbackCalciteException;
 import org.opensearch.sql.monitor.profile.ProfileContext;
 import org.opensearch.sql.monitor.profile.QueryProfiling;
 import org.opensearch.sql.opensearch.client.OpenSearchClient;
+import org.opensearch.sql.opensearch.executor.OpenSearchQueryManager;
 import org.opensearch.sql.opensearch.request.OpenSearchRequest;
 import org.opensearch.sql.opensearch.response.OpenSearchResponse;
+import org.opensearch.tasks.CancellableTask;
 
 /**
  * Utility class for asynchronously scanning an index. This lets us send background requests to the
@@ -107,10 +110,36 @@ public class BackgroundSearchScanner {
     if (isAsync()) {
       ProfileContext ctx = QueryProfiling.current();
       nextBatchFuture =
-          CompletableFuture.supplyAsync(
-              () -> QueryProfiling.withCurrentContext(ctx, () -> client.search(request)),
-              backgroundExecutor);
+          searchInBackground(
+              () -> QueryProfiling.withCurrentContext(ctx, () -> client.search(request)));
     }
+  }
+
+  /**
+   * Runs {@code search} on the background pool on behalf of the calling thread's query. The query's
+   * task lives in a thread-local that pool threads don't inherit, so it is captured here and set
+   * for the search; otherwise the search registers with no parent task and keeps running when the
+   * query is cancelled or times out.
+   */
+  private CompletableFuture<OpenSearchResponse> searchInBackground(
+      Supplier<OpenSearchResponse> search) {
+    final CancellableTask task = OpenSearchQueryManager.getCancellableTask();
+    return CompletableFuture.supplyAsync(
+        () -> {
+          final CancellableTask previous = OpenSearchQueryManager.getCancellableTask();
+          OpenSearchQueryManager.setCancellableTask(task);
+          try {
+            return search.get();
+          } finally {
+            // Pool threads are reused; leaving the task set would parent another query's searches.
+            if (previous == null) {
+              OpenSearchQueryManager.clearCancellableTask();
+            } else {
+              OpenSearchQueryManager.setCancellableTask(previous);
+            }
+          }
+        },
+        backgroundExecutor);
   }
 
   private OpenSearchResponse getCurrentResponse(OpenSearchRequest request) {
@@ -176,8 +205,7 @@ public class BackgroundSearchScanner {
 
       // Pre-fetch next batch if needed
       if (!stopIteration && isAsync()) {
-        nextBatchFuture =
-            CompletableFuture.supplyAsync(() -> client.search(request), backgroundExecutor);
+        nextBatchFuture = searchInBackground(() -> client.search(request));
       }
     } else {
       iterator = Collections.emptyIterator();
